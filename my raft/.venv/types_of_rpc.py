@@ -6,7 +6,7 @@ class RequestVote:
         self.last_log_term = last_log_term
     
     def __str__(self):
-        return "RequestVote, term " + str(self.term)
+        return "RequestVote from " + self.candidate_id + ", term " + str(self.term)
     
     
 class RequestVoteResponse:

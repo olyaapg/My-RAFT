@@ -3,8 +3,10 @@ import threading
 import aiohttp
 import asyncio
 import pickle
+import random
 from node_state import NodeState
 from types_of_rpc import RequestVote
+from my_timer import MyTimer
 
 class Node:
     def __init__(self, host: str, port: int, list_ip: list[str]):
@@ -12,11 +14,13 @@ class Node:
         self.port = port
         self.name = host + ':' + str(port)
         self.app = Flask(self.name) # Основной класс приложения Flask. Он управляет маршрутизацией, настройками и запускает веб-сервер.
+        self.start()
         self.nodes_sessions = {}
         self.state = NodeState.FOLLOWER
         self.currentTerm = 0
         self.votedFor = None
         self.log = []
+        self.votes_count = 0
         self.commitIndex = 0
         self.lastApplied = 0
         for key in ['http://' + ip for ip in list_ip]:
@@ -24,13 +28,15 @@ class Node:
         self.next_index = {}
         self.match_index = {}
         self.refresh_next_match_index()
-
+        self.election_timer = MyTimer(2 + random.random() * 10, self.start_election)
+        self.election_timer.start()
+        
         # Обработчик для входящих сообщений
         @self.app.route('/', methods=['POST'])
         def receive_message():
             data = pickle.loads(request.get_data()) # request: Объект, представляющий входящий HTTP-запрос. 
             if isinstance(data, RequestVote):
-                print(f"{self.name} получил сообщение от {data.candidate_id}: {data}")
+                print(f"{self.name} получил сообщение: {data}")
             return jsonify({"status": "received"}), 200 # response (jsonify): Объект ответа, который возвращается клиенту.
 
     def start(self):
@@ -75,3 +81,12 @@ class Node:
         for key in self.nodes_sessions.keys():
             self.next_index[key] = len(self.log)
             self.match_index[key] = 0
+            
+    def start_election(self):
+        print("election is starting!")
+        self.state = NodeState.CANDIDATE
+        self.currentTerm += 1
+        self.votes_count = 1
+        self.votedFor = self.name
+        asyncio.create_task(self.send_parallel_messages(self.nodes_sessions.keys(), RequestVote(self.currentTerm, self.name, len(self.log) - 1, 0)))
+    
