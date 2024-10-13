@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import pickle
 from node_state import NodeState
+from types_of_rpc import RequestVote
 
 class Node:
     def __init__(self, host: str, port: int, list_ip: list[str]):
@@ -28,9 +29,8 @@ class Node:
         @self.app.route('/', methods=['POST'])
         def receive_message():
             data = pickle.loads(request.get_data()) # request: Объект, представляющий входящий HTTP-запрос. 
-            message = data.get('message')
-            sender = data.get('sender')
-            print(f"{self.name} получил сообщение от {sender}: {message}")
+            if isinstance(data, RequestVote):
+                print(f"{self.name} получил сообщение от {data.candidate_id}: {data}")
             return jsonify({"status": "received"}), 200 # response (jsonify): Объект ответа, который возвращается клиенту.
 
     def start(self):
@@ -48,10 +48,8 @@ class Node:
             self.nodes_sessions[receiver_url] = aiohttp.ClientSession()
         async with self.nodes_sessions[receiver_url] as session:
             headers = {"Content-Type": "application/custom-type"}
-            payload = {"sender": self.name, "message": message}
-            json_data = pickle.dumps(payload)
             try:
-                async with session.post(receiver_url, data=json_data, headers=headers) as response:
+                async with session.post(receiver_url, data=pickle.dumps(message), headers=headers) as response:
                     if response.status == 200:
                         print(f"Сообщение отправлено успешно: {message}")
                     else:

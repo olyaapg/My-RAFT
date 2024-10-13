@@ -23,7 +23,7 @@ async def main():
 
     time.sleep(1)  # Даем время серверу запуститься
 
-    await node3.send_parallel_messages(['http://localhost:5000', 'http://localhost:5001', 'http://localhost:5003', 'http://localhost:5004'], RequestVote(1, '1', 0, 0))
+    await node3.send_parallel_messages(['http://localhost:5000', 'http://localhost:5001', 'http://localhost:5003', 'http://localhost:5004'], RequestVote(1, node3.name, 0, 0))
     await node5.send_parallel_messages(['http://localhost:5000', 'http://localhost:5001', 'http://localhost:5003', 'http://localhost:5002'], "TEST TEST TEST")
     
     # while True:
