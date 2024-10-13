@@ -27,7 +27,7 @@ class Node:
         # Обработчик для входящих сообщений
         @self.app.route('/', methods=['POST'])
         def receive_message():
-            data = request.json # request: Объект, представляющий входящий HTTP-запрос. 
+            data = pickle.loads(request.get_data()) # request: Объект, представляющий входящий HTTP-запрос. 
             message = data.get('message')
             sender = data.get('sender')
             print(f"{self.name} получил сообщение от {sender}: {message}")
@@ -47,9 +47,11 @@ class Node:
         if self.nodes_sessions[receiver_url] is None:
             self.nodes_sessions[receiver_url] = aiohttp.ClientSession()
         async with self.nodes_sessions[receiver_url] as session:
+            headers = {"Content-Type": "application/custom-type"}
             payload = {"sender": self.name, "message": message}
+            json_data = pickle.dumps(payload)
             try:
-                async with session.post(receiver_url, json=payload) as response:
+                async with session.post(receiver_url, data=json_data, headers=headers) as response:
                     if response.status == 200:
                         print(f"Сообщение отправлено успешно: {message}")
                     else:
