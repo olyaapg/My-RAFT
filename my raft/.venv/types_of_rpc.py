@@ -15,7 +15,7 @@ class RequestVoteResponse:
         self.vote_granted = vote_granted
     
     def __str__(self):
-        return "RequestVoteResponse, term " + str(self.term) + ", " + self.vote_granted
+        return "RequestVoteResponse, term " + str(self.term) + ", " + str(self.vote_granted)
     
     
 class AppendEntries:
