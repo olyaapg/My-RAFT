@@ -1,18 +1,18 @@
-class RequestVote:
-    def __init__(self, term: int, candidate_id: str, last_log_index: int, last_log_term: int):
-        self.term = term
-        self.candidate_id = candidate_id
-        self.last_log_index = last_log_index
-        self.last_log_term = last_log_term
+from pydantic import BaseModel
+
+class RequestVote(BaseModel):
+    term: int
+    candidate_id: str
+    last_log_index: int
+    last_log_term: int
     
     def __str__(self):
         return "RequestVote from " + self.candidate_id + ", term " + str(self.term)
     
     
-class RequestVoteResponse:
-    def __init__(self, term: int, vote_granted: bool):
-        self.term = term
-        self.vote_granted = vote_granted
+class RequestVoteResponse(BaseModel):
+    term: int
+    vote_granted: bool
     
     def __str__(self):
         return "RequestVoteResponse, term " + str(self.term) + ", " + str(self.vote_granted)
