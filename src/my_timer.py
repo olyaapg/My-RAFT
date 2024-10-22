@@ -2,12 +2,14 @@ import asyncio
 import random
 
 class MyTimer:
-    def __init__(self, function):
+    def __init__(self, init_time, function):
+        self.init_time = init_time
         self.function = function
         self.task = None
 
     async def _run(self):
-        interval = 2 + random.random() * 10
+        # interval = self.init_time + random.random() * 10
+        interval = self.init_time + random.random()
         await asyncio.sleep(interval)
         self.function()
 
