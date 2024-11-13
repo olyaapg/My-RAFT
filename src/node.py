@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from pydantic import BaseModel
 import uvicorn
 import asyncio
@@ -65,9 +65,27 @@ class Node:
             return {"status": "received"}, 200
 
         @self.app.post("/append-entries-response")
-        async def receive_append_entries_response(request: AppendEntriesResponse):
-            await self.processing_append_entries_response(request=request)
+        def receive_append_entries_response(
+            request: AppendEntriesResponse,
+            node_ip: str = Header(None, alias="X-Node-Ip"),
+        ):
+            print("receive_append_entries_response")
+            self.processing_append_entries_response(node=node_ip, request=request)
             return {"status": "received"}, 200
+
+        @self.app.get("/get")
+        def receive_get_from_client():
+            new_entry_index = len(self.log)
+            self.log.append(
+                LogEntry(
+                    command_index=Commands.SET,
+                    command_input={"key": "my_key", "value": "my_value"},
+                    term=self.current_term,
+                    index=new_entry_index,
+                )
+            )
+            print(self.log)
+            return {"result": ""}, 200
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -89,6 +107,34 @@ class Node:
         server = uvicorn.Server(config)
         await server.serve()
 
+    async def send_message(self, receiver: str, message: BaseModel):
+        if isinstance(message, RequestVote):
+            end = "request-vote"
+        elif isinstance(message, RequestVoteResponse):
+            end = "request-vote-response"
+        elif isinstance(message, AppendEntries):
+            end = "append-entries"
+        elif isinstance(message, AppendEntriesResponse):
+            end = "append-entries-response"
+        else:
+            end = ""
+        try:
+            print(message)
+            await self.client.post(
+                f"http://{receiver}/{end}",
+                json=message.model_dump(),
+                headers={"X-Node-Ip": self.name},
+            )
+        except Exception as e:
+            print(f"Failed to connect to {receiver}: {e}")
+
+    async def send_parallel_messages(self, receivers: list[str], message: BaseModel):
+        tasks = []
+        for receiver in receivers:
+            task = asyncio.create_task(self.send_message(receiver, message))
+            tasks.append(task)
+        await asyncio.gather(*tasks)
+
     async def processing_request_vote(self, request: RequestVote):
         print(
             f"{self.state} {self.host}:{self.port} received a vote request: {request.model_dump()}"
@@ -101,9 +147,9 @@ class Node:
             )
             return
         self.update_term(request.term)
-        if (self.voted_for is not None) | (request.last_log_term < self.log[-1].term):
+        if (self.voted_for is not None) or (request.last_log_term < self.log[-1].term):
             vote = False
-        elif (request.last_log_term == self.log[-1].term) & (
+        elif (request.last_log_term == self.log[-1].term) and (
             request.last_log_index < (len(self.log) - 1)
         ):
             vote = False
@@ -140,7 +186,16 @@ class Node:
             )
             return
         self.leader = request.leader_id
-        if (len(self.log) - 1 < request.prev_log_index) | (
+        self.election_timer.start()
+        # Если индекс последнего элемента меньше индекса предыдущей записи запроса,
+        # т.е. если в логе нет предыдущей записи
+        print("LOG  ", self.log)
+        # print(len(self.log) - 1 < request.prev_log_index)
+        # print(request.prev_log_index)
+        # print(request.prev_log_term)
+        # print(self.log[request.prev_log_index])
+        # print(self.log[request.prev_log_index].term != request.prev_log_term)
+        if (len(self.log) - 1 < request.prev_log_index) or (
             self.log[request.prev_log_index].term != request.prev_log_term
         ):
             self.log = self.log[: request.prev_log_index]
@@ -149,9 +204,8 @@ class Node:
                 AppendEntriesResponse(term=self.current_term, success=False),
             )
             return
-        self.election_timer.start()
         if len(request.entries) > 0:
-            self.log.append(request.entries)
+            self.log.extend(request.entries)
         await self.send_message(
             request.leader_id,
             AppendEntriesResponse(term=self.current_term, success=True),
@@ -163,36 +217,28 @@ class Node:
                     command_index=entry.command_index, command_input=entry.command_input
                 )
 
-    async def processing_append_entries_response(self, request: AppendEntriesResponse):
+    def processing_append_entries_response(
+        self, node: str, request: AppendEntriesResponse
+    ):
         print(
             f"{self.state} {self.host}:{self.port} received an append entries response: {request.model_dump()}"
         )
-        print(request.model_dump())
-
-    async def send_message(self, receiver: str, message: BaseModel):
-        if isinstance(message, RequestVote):
-            end = "request-vote"
-        elif isinstance(message, RequestVoteResponse):
-            end = "request-vote-response"
-        elif isinstance(message, AppendEntries):
-            end = "append-entries"
-        elif isinstance(message, AppendEntriesResponse):
-            end = "append-entries-response"
-        else:
-            end = ""
-        try:
-            await self.client.post(
-                f"http://{receiver}/{end}", json=message.model_dump()
-            )
-        except Exception as e:
-            print(f"Failed to connect to {receiver}: {e}")
-
-    async def send_parallel_messages(self, receivers: list[str], message: BaseModel):
-        tasks = []
-        for receiver in receivers:
-            task = asyncio.create_task(self.send_message(receiver, message))
-            tasks.append(task)
-        await asyncio.gather(*tasks)
+        self.update_term(request.term)
+        if self.state != NodeState.LEADER:
+            return
+        print(len(self.log) > self.next_index[node])
+        print(self.match_index[node] == self.next_index[node])
+        # Если у ноды всё ещё есть не все записи и некоторая запись была реплицирована
+        if (len(self.log) > self.next_index[node]) and (
+            self.match_index[node] == self.next_index[node]
+        ):
+            if request.success:
+                self.next_index[node] += 1
+                self.update_commit_index()
+                print("after update commit index")
+            else:
+                self.next_index[node] -= 1
+            print("finish")
 
     async def start_election(self):
         self.state = NodeState.CANDIDATE
@@ -215,40 +261,56 @@ class Node:
         print(f"{self.name}: I'm a leader!")
         self.state = NodeState.LEADER
         self.election_timer.cancel()
-        await self.heartbeat()
         self.leader = self.name
         for node in self.nodes:
             self.next_index[node] = len(self.log)
             self.match_index[node] = 0
+        await self.heartbeat()
 
-    # TODO
     async def heartbeat(self):
-        if self.commit_index < len(self.log) - 1:
-            entries = self.log[self.commit_index + 1 : self.commit_index + 6]
-            prev_log_index = self.commit_index
-            prev_log_term = self.log[self.commit_index].term
-        else:
+        for node in self.nodes:
+            prev_log_index = self.next_index[node] - 1
             entries = []
-            prev_log_index = len(self.log) - 1
-            prev_log_term = self.log[-1].term
-        await self.send_parallel_messages(
-            self.nodes,
-            AppendEntries(
-                term=self.current_term,
-                leader_id=self.name,
-                prev_log_index=prev_log_index,
-                prev_log_term=prev_log_term,
-                entries=entries,
-                leader_commit_index=self.commit_index,
-            ),
-        )
+            # if (self.next_index[node] - 1 != self.match_index[node]) and (self.next_index[node] != len(self.log)):
+            if len(self.log) - 1 >= self.next_index[node]:
+                entries = [self.log[self.next_index[node]]]
+                self.match_index[node] += 1
+            await self.send_message(
+                node,
+                AppendEntries(
+                    term=self.current_term,
+                    leader_id=self.name,
+                    prev_log_index=prev_log_index,
+                    prev_log_term=self.log[prev_log_index].term,
+                    entries=entries,
+                    leader_commit_index=self.commit_index,
+                ),
+            )
+        print("HB")
         self.leader_timer.start()
 
     def update_term(self, term: int):
         if term > self.current_term:
             self.current_term = term
             self.state = NodeState.FOLLOWER
+            print("Now I'm a FOLLOWER")
             self.leader_timer.cancel()
             self.voted_for = None
             self.votes_count = 0
             self.election_timer.start()
+
+    # If there exists an N such that N > commitIndex, a majority
+    # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+    # set commitIndex = N
+    def update_commit_index(self):
+        for N in range(self.commit_index + 1, len(self.log)):
+            count = sum(1 for match in self.match_index.values() if match >= N)
+            if count >= ((len(self.nodes) + 1) / 2):
+                if self.log[N].term == self.current_term:
+                    self.commit_index = N
+            else:
+                return
+        for i in range(self.last_applied + 1, self.commit_index + 1):
+            self.state_machine.apply_command(
+                self.log[i].command_index, self.log[i].command_input
+            )

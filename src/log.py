@@ -8,3 +8,6 @@ class LogEntry(BaseModel):
     command_input: Any
     term: int
     index: int
+
+    class Config:
+        use_enum_values = True
