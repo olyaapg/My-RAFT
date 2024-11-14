@@ -1,5 +1,7 @@
-from fastapi import FastAPI, Header
-from pydantic import BaseModel
+from email import message
+from xml.dom.minidom import Element
+from fastapi import FastAPI, Header, Request, Response
+from pydantic import BaseModel, Json
 import uvicorn
 import asyncio
 import httpx
@@ -14,7 +16,7 @@ from types_of_rpc import (
     RequestVoteResponse,
 )
 from my_timer import MyTimer
-from state_machine import StateMachine, Commands
+from state_machine import Entry, InvalidCommandError, StateMachine, Commands
 
 
 class Node:
@@ -45,47 +47,57 @@ class Node:
         self.election_timer = MyTimer(6, self.start_election)
         self.leader_timer = MyTimer(2, self.heartbeat)
 
-        @self.app.get("/")
+        @self.app.get("/", status_code=200)
         def hello_from_node():
             return {"message": f"Hello from Node at {self.host}:{self.port}"}
 
-        @self.app.post("/request-vote")
+        @self.app.post("/request-vote", status_code=200)
         async def receive_request_vote(request: RequestVote):
             await self.processing_request_vote(request=request)
-            return {"status": "received"}, 200
+            return {"status": "received"}
 
-        @self.app.post("/request-vote-response")
+        @self.app.post("/request-vote-response", status_code=200)
         async def receive_request_vote_response(request: RequestVoteResponse):
             await self.processing_request_vote_response(request=request)
-            return {"status": "received"}, 200
+            return {"status": "received"}
 
-        @self.app.post("/append-entries")
+        @self.app.post("/append-entries", status_code=200)
         async def receive_append_entries(request: AppendEntries):
             await self.processing_append_entries(request=request)
-            return {"status": "received"}, 200
+            return {"status": "received"}
 
-        @self.app.post("/append-entries-response")
+        @self.app.post("/append-entries-response", status_code=200)
         def receive_append_entries_response(
             request: AppendEntriesResponse,
             node_ip: str = Header(None, alias="X-Node-Ip"),
         ):
-            print("receive_append_entries_response")
             self.processing_append_entries_response(node=node_ip, request=request)
-            return {"status": "received"}, 200
+            return {"status": "received"}
 
-        @self.app.get("/get")
-        def receive_get_from_client():
-            new_entry_index = len(self.log)
-            self.log.append(
-                LogEntry(
-                    command_index=Commands.SET,
-                    command_input={"key": "my_key", "value": "my_value"},
-                    term=self.current_term,
-                    index=new_entry_index,
-                )
+        @self.app.get("/get/{key}", status_code=200)
+        def receive_get_from_client(response: Response, key: str):
+            print(
+                f"{self.state} {self.host}:{self.port} received a get request from client: key={key}"
             )
-            print(self.log)
-            return {"result": ""}, 200
+            try:
+                entry = Entry(key=key, value=None)
+                entry.value = self.state_machine.apply_command(Commands.GET, entry)
+            except KeyError:
+                response.status_code = 404
+                return {"message": "Incorrect key"}
+            return entry.value
+
+        @self.app.post("/set", status_code=200)
+        async def receive_set_from_client(response: Response, request: Entry):
+            if self.leader != self.name:
+                response.status_code = 418
+                if self.leader is None:
+                    message = "I don't know who the leader is.🤷"
+                else:
+                    message = f"I'm not a leader! Send the request to 👉{self.leader}"
+                return {"message": message}
+            await self.processing_set_from_client(request)
+            return {}
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -119,7 +131,6 @@ class Node:
         else:
             end = ""
         try:
-            print(message)
             await self.client.post(
                 f"http://{receiver}/{end}",
                 json=message.model_dump(),
@@ -178,23 +189,21 @@ class Node:
         print(
             f"{self.state} {self.host}:{self.port} received an append entries: {request.model_dump()}\n"
         )
-        self.update_term(request.term)
         if request.term < self.current_term:
             await self.send_message(
                 request.leader_id,
                 AppendEntriesResponse(term=self.current_term, success=False),
             )
             return
+        if self.state == NodeState.CANDIDATE:
+            candidate = True
+        else:
+            candidate = False
+        self.update_term(request.term, candidate=candidate)
         self.leader = request.leader_id
         self.election_timer.start()
         # Если индекс последнего элемента меньше индекса предыдущей записи запроса,
         # т.е. если в логе нет предыдущей записи
-        print("LOG  ", self.log)
-        # print(len(self.log) - 1 < request.prev_log_index)
-        # print(request.prev_log_index)
-        # print(request.prev_log_term)
-        # print(self.log[request.prev_log_index])
-        # print(self.log[request.prev_log_index].term != request.prev_log_term)
         if (len(self.log) - 1 < request.prev_log_index) or (
             self.log[request.prev_log_index].term != request.prev_log_term
         ):
@@ -203,19 +212,21 @@ class Node:
                 request.leader_id,
                 AppendEntriesResponse(term=self.current_term, success=False),
             )
+            print(f"LOG   {self.log}\n")
             return
         if len(request.entries) > 0:
             self.log.extend(request.entries)
-        await self.send_message(
-            request.leader_id,
-            AppendEntriesResponse(term=self.current_term, success=True),
-        )
         if request.leader_commit_index > self.commit_index:
-            self.commit_index = min(request.leader_commit_index, len(self.log))
+            self.commit_index = min(request.leader_commit_index, len(self.log) - 1)
             for entry in self.log[self.last_applied + 1 : self.commit_index + 1]:
                 self.state_machine.apply_command(
                     command_index=entry.command_index, command_input=entry.command_input
                 )
+        print(f"LOG   {self.log}\n")
+        await self.send_message(
+            request.leader_id,
+            AppendEntriesResponse(term=self.current_term, success=True),
+        )
 
     def processing_append_entries_response(
         self, node: str, request: AppendEntriesResponse
@@ -226,25 +237,46 @@ class Node:
         self.update_term(request.term)
         if self.state != NodeState.LEADER:
             return
-        print(len(self.log) > self.next_index[node])
-        print(self.match_index[node] == self.next_index[node])
-        # Если у ноды всё ещё есть не все записи и некоторая запись была реплицирована
-        if (len(self.log) > self.next_index[node]) and (
-            self.match_index[node] == self.next_index[node]
-        ):
-            if request.success:
-                self.next_index[node] += 1
+        # Если нода ответила, что имеет запись с prev_log_index и prev_log_term,
+        # и у неё ещё не все записи есть
+        if request.success:
+            self.match_index[node] = min(self.next_index[node], len(self.log) - 1)
+            self.next_index[node] = min(self.next_index[node] + 1, len(self.log))
+            if self.commit_index != len(self.log) - 1:
                 self.update_commit_index()
-                print("after update commit index")
-            else:
-                self.next_index[node] -= 1
-            print("finish")
+        elif not request.success:
+            self.next_index[node] -= 1
+            self.match_index[node] = 0
+
+    async def processing_set_from_client(self, data: Entry):
+        print(
+            f"{self.state} {self.host}:{self.port} received a set request from client: {data}"
+        )
+        new_entry_index = len(self.log)
+        self.log.append(
+            LogEntry(
+                command_index=Commands.SET,
+                command_input=data,
+                term=self.current_term,
+                index=new_entry_index,
+            )
+        )
+
+        async def wait_for_applying():
+            while self.last_applied < new_entry_index:
+                # print(
+                #     f"last_applied = {self.last_applied}, new_entry_index = {new_entry_index}"
+                # )
+                await asyncio.sleep(1)
+
+        await wait_for_applying()
 
     async def start_election(self):
         self.state = NodeState.CANDIDATE
         self.current_term += 1
         self.votes_count = 1
         self.voted_for = self.name
+        self.leader = None
         print(f"{self.name}: election is starting! Term - {self.current_term}")
         await self.send_parallel_messages(
             self.nodes,
@@ -272,9 +304,9 @@ class Node:
             prev_log_index = self.next_index[node] - 1
             entries = []
             # if (self.next_index[node] - 1 != self.match_index[node]) and (self.next_index[node] != len(self.log)):
-            if len(self.log) - 1 >= self.next_index[node]:
+            # Если у ноды есть не все записи
+            if len(self.log) > self.next_index[node]:
                 entries = [self.log[self.next_index[node]]]
-                self.match_index[node] += 1
             await self.send_message(
                 node,
                 AppendEntries(
@@ -286,11 +318,10 @@ class Node:
                     leader_commit_index=self.commit_index,
                 ),
             )
-        print("HB")
         self.leader_timer.start()
 
-    def update_term(self, term: int):
-        if term > self.current_term:
+    def update_term(self, term: int, candidate=False):
+        if term > self.current_term or candidate:
             self.current_term = term
             self.state = NodeState.FOLLOWER
             print("Now I'm a FOLLOWER")
@@ -305,12 +336,17 @@ class Node:
     def update_commit_index(self):
         for N in range(self.commit_index + 1, len(self.log)):
             count = sum(1 for match in self.match_index.values() if match >= N)
-            if count >= ((len(self.nodes) + 1) / 2):
+            if count + 1 > ((len(self.nodes) + 1) / 2):
                 if self.log[N].term == self.current_term:
                     self.commit_index = N
             else:
-                return
+                break
         for i in range(self.last_applied + 1, self.commit_index + 1):
-            self.state_machine.apply_command(
-                self.log[i].command_index, self.log[i].command_input
-            )
+            try:
+                self.state_machine.apply_command(
+                    self.log[i].command_index, self.log[i].command_input
+                )
+            except InvalidCommandError as e:
+                print(f"Сообщение об ошибке: {e}")
+            finally:
+                self.last_applied += 1
