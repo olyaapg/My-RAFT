@@ -1,7 +1,5 @@
-from email import message
-from xml.dom.minidom import Element
-from fastapi import FastAPI, Header, Request, Response
-from pydantic import BaseModel, Json
+from fastapi import FastAPI, Header, Response
+from pydantic import BaseModel
 import uvicorn
 import asyncio
 import httpx
@@ -17,6 +15,7 @@ from types_of_rpc import (
 )
 from my_timer import MyTimer
 from state_machine import Entry, InvalidCommandError, StateMachine, Commands
+import requests
 
 
 class Node:
@@ -67,11 +66,11 @@ class Node:
             return {"status": "received"}
 
         @self.app.post("/append-entries-response", status_code=200)
-        def receive_append_entries_response(
+        async def receive_append_entries_response(
             request: AppendEntriesResponse,
             node_ip: str = Header(None, alias="X-Node-Ip"),
         ):
-            self.processing_append_entries_response(node=node_ip, request=request)
+            await self.processing_append_entries_response(node=node_ip, request=request)
             return {"status": "received"}
 
         @self.app.get("/get/{key}", status_code=200)
@@ -108,11 +107,11 @@ class Node:
         finally:
             print(f"Node {self.host}:{self.port} is shutting down...")
             await self.client.aclose()
-            self.leader_timer.cancel()
-            self.election_timer.cancel()
+            await self.leader_timer.cancel()
+            await self.election_timer.cancel()
 
     async def start(self):
-        self.election_timer.start()
+        await self.election_timer.start()
         config = uvicorn.Config(
             self.app, host=self.host, port=self.port, log_level="critical"
         )
@@ -131,11 +130,16 @@ class Node:
         else:
             end = ""
         try:
+            print(f"send message to {receiver}")
             await self.client.post(
                 f"http://{receiver}/{end}",
                 json=message.model_dump(),
                 headers={"X-Node-Ip": self.name},
+                timeout=0.5,
             )
+            print("отправил")
+        except requests.exceptions.RequestException as e:
+            print(f"RequestException {receiver}: {e}")
         except Exception as e:
             print(f"Failed to connect to {receiver}: {e}")
 
@@ -157,7 +161,7 @@ class Node:
                 message=RequestVoteResponse(term=self.current_term, vote_granted=vote),
             )
             return
-        self.update_term(request.term)
+        await self.update_term(request.term)
         if (self.voted_for is not None) or (request.last_log_term < self.log[-1].term):
             vote = False
         elif (request.last_log_term == self.log[-1].term) and (
@@ -167,7 +171,7 @@ class Node:
         else:
             vote = True
             self.voted_for = request.candidate_id
-            self.election_timer.start()
+            await self.election_timer.start()
         await self.send_message(
             receiver=request.candidate_id,
             message=RequestVoteResponse(term=self.current_term, vote_granted=vote),
@@ -177,7 +181,7 @@ class Node:
         print(
             f"{self.state} {self.host}:{self.port} received a vote request response: {request.model_dump()}"
         )
-        self.update_term(request.term)
+        await self.update_term(request.term)
         if self.state != NodeState.CANDIDATE:
             return
         if request.vote_granted == True:
@@ -199,9 +203,8 @@ class Node:
             candidate = True
         else:
             candidate = False
-        self.update_term(request.term, candidate=candidate)
+        await self.update_term(request.term, candidate=candidate)
         self.leader = request.leader_id
-        self.election_timer.start()
         # Если индекс последнего элемента меньше индекса предыдущей записи запроса,
         # т.е. если в логе нет предыдущей записи
         if (len(self.log) - 1 < request.prev_log_index) or (
@@ -213,6 +216,7 @@ class Node:
                 AppendEntriesResponse(term=self.current_term, success=False),
             )
             print(f"LOG   {self.log}\n")
+            await self.election_timer.start()
             return
         if len(request.entries) > 0:
             self.log.extend(request.entries)
@@ -227,14 +231,15 @@ class Node:
             request.leader_id,
             AppendEntriesResponse(term=self.current_term, success=True),
         )
+        await self.election_timer.start()
 
-    def processing_append_entries_response(
+    async def processing_append_entries_response(
         self, node: str, request: AppendEntriesResponse
     ):
         print(
             f"{self.state} {self.host}:{self.port} received an append entries response: {request.model_dump()}"
         )
-        self.update_term(request.term)
+        await self.update_term(request.term)
         if self.state != NodeState.LEADER:
             return
         # Если нода ответила, что имеет запись с prev_log_index и prev_log_term,
@@ -264,9 +269,6 @@ class Node:
 
         async def wait_for_applying():
             while self.last_applied < new_entry_index:
-                # print(
-                #     f"last_applied = {self.last_applied}, new_entry_index = {new_entry_index}"
-                # )
                 await asyncio.sleep(1)
 
         await wait_for_applying()
@@ -287,12 +289,14 @@ class Node:
                 last_log_term=self.log[-1].term,
             ),
         )
-        self.election_timer.start()
+        # loop = asyncio.get_event_loop()
+        # loop.call_later(0.5, lambda: self.election_timer.start())
+        await self.election_timer.start()
 
     async def become_leader(self):
         print(f"{self.name}: I'm a leader!")
         self.state = NodeState.LEADER
-        self.election_timer.cancel()
+        await self.election_timer.cancel()
         self.leader = self.name
         for node in self.nodes:
             self.next_index[node] = len(self.log)
@@ -300,35 +304,43 @@ class Node:
         await self.heartbeat()
 
     async def heartbeat(self):
+        print("HB")
+        tasks = []
         for node in self.nodes:
             prev_log_index = self.next_index[node] - 1
             entries = []
-            # if (self.next_index[node] - 1 != self.match_index[node]) and (self.next_index[node] != len(self.log)):
-            # Если у ноды есть не все записи
             if len(self.log) > self.next_index[node]:
                 entries = [self.log[self.next_index[node]]]
-            await self.send_message(
-                node,
-                AppendEntries(
-                    term=self.current_term,
-                    leader_id=self.name,
-                    prev_log_index=prev_log_index,
-                    prev_log_term=self.log[prev_log_index].term,
-                    entries=entries,
-                    leader_commit_index=self.commit_index,
-                ),
+            tasks.append(
+                self.send_message(
+                    node,
+                    AppendEntries(
+                        term=self.current_term,
+                        leader_id=self.name,
+                        prev_log_index=prev_log_index,
+                        prev_log_term=self.log[prev_log_index].term,
+                        entries=entries,
+                        leader_commit_index=self.commit_index,
+                    ),
+                )
             )
-        self.leader_timer.start()
+        print("gather")
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as ex:
+            print("heartbeat gather ex", ex)
+        print("return")
+        await self.leader_timer.start()
 
-    def update_term(self, term: int, candidate=False):
+    async def update_term(self, term: int, candidate=False):
         if term > self.current_term or candidate:
             self.current_term = term
             self.state = NodeState.FOLLOWER
             print("Now I'm a FOLLOWER")
-            self.leader_timer.cancel()
+            await self.leader_timer.cancel()
             self.voted_for = None
             self.votes_count = 0
-            self.election_timer.start()
+            await self.election_timer.start()
 
     # If there exists an N such that N > commitIndex, a majority
     # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
