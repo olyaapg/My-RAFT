@@ -2,7 +2,7 @@ import asyncio
 import sys
 from node import Node
 
-#py src\main.py 5000 localhost:5001 localhost:5002 localhost:5003
+#py src\main.py 5000 localhost:5001 localhost:5002 localhost:5003 localhost:5004
 async def main():
     node = Node(int(args[0]), args[1:])
     await node.start()

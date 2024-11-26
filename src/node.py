@@ -130,16 +130,12 @@ class Node:
         else:
             end = ""
         try:
-            print(f"send message to {receiver}")
             await self.client.post(
                 f"http://{receiver}/{end}",
                 json=message.model_dump(),
                 headers={"X-Node-Ip": self.name},
-                timeout=0.5,
+                timeout=0.5
             )
-            print("отправил")
-        except requests.exceptions.RequestException as e:
-            print(f"RequestException {receiver}: {e}")
         except Exception as e:
             print(f"Failed to connect to {receiver}: {e}")
 
@@ -158,7 +154,7 @@ class Node:
             vote = False
             await self.send_message(
                 receiver=request.candidate_id,
-                message=RequestVoteResponse(term=self.current_term, vote_granted=vote),
+                message=RequestVoteResponse(term=self.current_term, vote_granted=vote)
             )
             return
         await self.update_term(request.term)
@@ -174,7 +170,7 @@ class Node:
             await self.election_timer.start()
         await self.send_message(
             receiver=request.candidate_id,
-            message=RequestVoteResponse(term=self.current_term, vote_granted=vote),
+            message=RequestVoteResponse(term=self.current_term, vote_granted=vote)
         )
 
     async def processing_request_vote_response(self, request: RequestVoteResponse):
@@ -213,7 +209,7 @@ class Node:
             self.log = self.log[: request.prev_log_index]
             await self.send_message(
                 request.leader_id,
-                AppendEntriesResponse(term=self.current_term, success=False),
+                AppendEntriesResponse(term=self.current_term, success=False)
             )
             print(f"LOG   {self.log}\n")
             await self.election_timer.start()
@@ -229,7 +225,7 @@ class Node:
         print(f"LOG   {self.log}\n")
         await self.send_message(
             request.leader_id,
-            AppendEntriesResponse(term=self.current_term, success=True),
+            AppendEntriesResponse(term=self.current_term, success=True)
         )
         await self.election_timer.start()
 
@@ -263,7 +259,7 @@ class Node:
                 command_index=Commands.SET,
                 command_input=data,
                 term=self.current_term,
-                index=new_entry_index,
+                index=new_entry_index
             )
         )
 
@@ -286,11 +282,9 @@ class Node:
                 term=self.current_term,
                 candidate_id=self.name,
                 last_log_index=len(self.log) - 1,
-                last_log_term=self.log[-1].term,
+                last_log_term=self.log[-1].term
             ),
         )
-        # loop = asyncio.get_event_loop()
-        # loop.call_later(0.5, lambda: self.election_timer.start())
         await self.election_timer.start()
 
     async def become_leader(self):
@@ -320,23 +314,21 @@ class Node:
                         prev_log_index=prev_log_index,
                         prev_log_term=self.log[prev_log_index].term,
                         entries=entries,
-                        leader_commit_index=self.commit_index,
+                        leader_commit_index=self.commit_index
                     ),
                 )
             )
-        print("gather")
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as ex:
             print("heartbeat gather ex", ex)
-        print("return")
         await self.leader_timer.start()
 
     async def update_term(self, term: int, candidate=False):
         if term > self.current_term or candidate:
             self.current_term = term
             self.state = NodeState.FOLLOWER
-            print("Now I'm a FOLLOWER")
+            print("When updating the term, I became a FOLLOWER")
             await self.leader_timer.cancel()
             self.voted_for = None
             self.votes_count = 0
