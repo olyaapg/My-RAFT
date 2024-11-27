@@ -43,7 +43,7 @@ class Node:
         self.match_index = {}
 
         self.leader = None
-        self.election_timer = MyTimer(6, self.start_election)
+        self.election_timer = MyTimer(6, self.start_election, True)
         self.leader_timer = MyTimer(2, self.heartbeat)
 
         @self.app.get("/", status_code=200)
@@ -134,7 +134,7 @@ class Node:
                 f"http://{receiver}/{end}",
                 json=message.model_dump(),
                 headers={"X-Node-Ip": self.name},
-                timeout=0.5
+                timeout=0.05
             )
         except Exception as e:
             print(f"Failed to connect to {receiver}: {e}")
@@ -147,9 +147,9 @@ class Node:
         await asyncio.gather(*tasks)
 
     async def processing_request_vote(self, request: RequestVote):
-        print(
-            f"{self.state} {self.host}:{self.port} received a vote request: {request.model_dump()}"
-        )
+        # print(
+        #     f"{self.state} {self.host}:{self.port} received a vote request: {request.model_dump()}"
+        # )
         if request.term < self.current_term:
             vote = False
             await self.send_message(
@@ -174,9 +174,9 @@ class Node:
         )
 
     async def processing_request_vote_response(self, request: RequestVoteResponse):
-        print(
-            f"{self.state} {self.host}:{self.port} received a vote request response: {request.model_dump()}"
-        )
+        # print(
+        #     f"{self.state} {self.host}:{self.port} received a vote request response: {request.model_dump()}"
+        # )
         await self.update_term(request.term)
         if self.state != NodeState.CANDIDATE:
             return
@@ -186,9 +186,10 @@ class Node:
                 await self.become_leader()
 
     async def processing_append_entries(self, request: AppendEntries):
-        print(
-            f"{self.state} {self.host}:{self.port} received an append entries: {request.model_dump()}\n"
-        )
+        # print(
+        #     f"{self.state} {self.host}:{self.port} received an append entries: {request.model_dump()}\n"
+        # )
+        print(f'{request.term}, {self.current_term}')
         if request.term < self.current_term:
             await self.send_message(
                 request.leader_id,
@@ -232,9 +233,9 @@ class Node:
     async def processing_append_entries_response(
         self, node: str, request: AppendEntriesResponse
     ):
-        print(
-            f"{self.state} {self.host}:{self.port} received an append entries response: {request.model_dump()}"
-        )
+        # print(
+        #     f"{self.state} {self.host}:{self.port} received an append entries response: {request.model_dump()}"
+        # )
         await self.update_term(request.term)
         if self.state != NodeState.LEADER:
             return
