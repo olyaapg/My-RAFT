@@ -1,4 +1,3 @@
-from typing import Any
 from pydantic import BaseModel
 from state_machine import Commands, Entry
 

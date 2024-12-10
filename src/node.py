@@ -1,3 +1,4 @@
+from sys import version
 from fastapi import FastAPI, Header, Response
 from pydantic import BaseModel
 import uvicorn
@@ -5,6 +6,7 @@ import asyncio
 import httpx
 from contextlib import asynccontextmanager
 
+from lock import LockEntry
 from node_state import NodeState
 from log import LogEntry
 from types_of_rpc import (
@@ -15,7 +17,6 @@ from types_of_rpc import (
 )
 from my_timer import MyTimer
 from state_machine import Entry, InvalidCommandError, StateMachine, Commands
-import requests
 
 
 class Node:
@@ -35,6 +36,9 @@ class Node:
         self.log = [
             LogEntry(command_index=Commands.GET, command_input=None, term=0, index=0)
         ]
+        
+        self.lock_log = {}
+        self.lock = asyncio.Lock()
 
         self.commit_index = 0
         self.last_applied = 0
@@ -68,7 +72,7 @@ class Node:
         @self.app.post("/append-entries-response", status_code=200)
         async def receive_append_entries_response(
             request: AppendEntriesResponse,
-            node_ip: str = Header(None, alias="X-Node-Ip"),
+            node_ip: str = Header(None, alias="X-Node-Ip")
         ):
             await self.processing_append_entries_response(node=node_ip, request=request)
             return {"status": "received"}
@@ -97,6 +101,22 @@ class Node:
                 return {"message": message}
             await self.processing_set_from_client(request)
             return {}
+        
+        @self.app.post("/lock", status_code=200)
+        async def receive_lock_from_client(response: Response, lock_entry: LockEntry):
+            if self.leader != self.name:
+                response.status_code = 418
+                if self.leader is None:
+                    message = "I don't know who the leader is.🤷"
+                else:
+                    message = f"I'm not a leader! Send the request to 👉{self.leader}"
+                return {"message": message}
+            (locked, version) = await self.processing_lock_from_client(lock_entry)
+            print(locked)
+            if not locked:
+                response.status_code = 409
+            print(response.status_code)
+            return {"locked": locked, "version": version}
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -335,6 +355,13 @@ class Node:
             self.votes_count = 0
             await self.election_timer.start()
 
+
+    #################################################################################
+    # Функции, используемые в блокировке
+    #################################################################################
+    
+    
+
     # If there exists an N such that N > commitIndex, a majority
     # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
     # set commitIndex = N
@@ -355,3 +382,47 @@ class Node:
                 print(f"Сообщение об ошибке: {e}")
             finally:
                 self.last_applied += 1
+
+
+    async def compare_and_swap(self, key: str, nextValue: str, currValue: str, currVersion: int, ttl: int):
+        async with self.lock:
+            try:
+                found: LockEntry = self.lock_log[key]
+                if (found.lock_owner == currValue) and (found.lock_version == currVersion):
+                    currVersion += 1
+                    self.lock_log[key] = LockEntry(lock_name=key, lock_owner=nextValue, lock_version=currVersion, lock_ttl=ttl)
+                    return True, currVersion, None
+                return False, found.lock_version, None
+            except KeyError as e:
+                lock_owner = None
+                version = 0
+                if (currValue is lock_owner) and (currVersion == version):
+                    version += 1
+                    self.lock_log[key] = LockEntry(lock_name=key, lock_owner=nextValue, lock_version=version, lock_ttl=ttl)
+                    return True, version, None
+                return False, version, f"For key='{key}' expected lock_owner='{currValue}' and version='{currVersion}' but was empty value"
+                
+
+
+    async def processing_lock_from_client(self, lock_entry: LockEntry):
+        print(
+            f"{self.state} {self.host}:{self.port} received a lock request from client: {lock_entry}"
+        )
+        locked, version, error = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue='unlocked', currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
+        if error is not None:
+            print(error)
+            locked, version, error = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue=None, currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
+        if locked:
+            async def watchdog():
+                await asyncio.sleep(lock_entry.lock_ttl)
+                await self.unlock(key=lock_entry.lock_name, currValue=lock_entry.lock_owner, currVersion=version)
+                
+            asyncio.ensure_future(watchdog())
+        return locked, version
+
+
+    async def unlock(self, key: str, currValue: str, currVersion: int):
+        print(
+            f"{self.state} {self.host}:{self.port} is unlocking for key = {key}"
+        )
+        await self.compare_and_swap(key=key, nextValue='unlocked', currValue=currValue, currVersion=currVersion, ttl=0)
