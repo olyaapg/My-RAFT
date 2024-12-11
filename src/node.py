@@ -15,7 +15,6 @@ from types_of_rpc import (
 )
 from my_timer import MyTimer
 from state_machine import Entry, InvalidCommandError, StateMachine, Commands
-import requests
 
 
 class Node:
@@ -96,6 +95,18 @@ class Node:
                     message = f"I'm not a leader! Send the request to 👉{self.leader}"
                 return {"message": message}
             await self.processing_set_from_client(request)
+            return {}
+        
+        @self.app.post("/cas", status_code=200)
+        def receive_cas_from_client(response: Response, request: Entry):
+            if self.leader != self.name:
+                response.status_code = 418
+                if self.leader is None:
+                    message = "I don't know who the leader is.🤷"
+                else:
+                    message = f"I'm not a leader! Send the request to 👉{self.leader}"
+                return {"message": message}
+            self.processing_cas_from_client(request)
             return {}
 
     @asynccontextmanager
@@ -269,6 +280,20 @@ class Node:
                 await asyncio.sleep(1)
 
         await wait_for_applying()
+
+    def processing_cas_from_client(self, data: Entry):
+        print(
+            f"{self.state} {self.host}:{self.port} received a cas request from client: {data}"
+        )
+        new_entry_index = len(self.log)
+        self.log.append(
+            LogEntry(
+                command_index=Commands.CAS,
+                command_input=data,
+                term=self.current_term,
+                index=new_entry_index
+            )
+        )
 
     async def start_election(self):
         self.state = NodeState.CANDIDATE
