@@ -6,7 +6,7 @@ import asyncio
 import httpx
 from contextlib import asynccontextmanager
 
-from lock import LockEntry
+from lock import LockEntry, SetData
 from node_state import NodeState
 from log import LogEntry
 from types_of_rpc import (
@@ -91,7 +91,7 @@ class Node:
             return entry.value
 
         @self.app.post("/set", status_code=200)
-        async def receive_set_from_client(response: Response, request: Entry):
+        async def receive_set_from_client(response: Response, request: SetData):
             if self.leader != self.name:
                 response.status_code = 418
                 if self.leader is None:
@@ -99,8 +99,10 @@ class Node:
                 else:
                     message = f"I'm not a leader! Send the request to 👉{self.leader}"
                 return {"message": message}
-            await self.processing_set_from_client(request)
-            return {}
+            (success, info) = await self.processing_set_from_client(request)
+            if not success:
+                response.status_code = 409
+            return info
         
         @self.app.post("/lock", status_code=200)
         async def receive_lock_from_client(response: Response, lock_entry: LockEntry):
@@ -112,11 +114,35 @@ class Node:
                     message = f"I'm not a leader! Send the request to 👉{self.leader}"
                 return {"message": message}
             (locked, version) = await self.processing_lock_from_client(lock_entry)
-            print(locked)
             if not locked:
                 response.status_code = 409
-            print(response.status_code)
             return {"locked": locked, "version": version}
+        
+        @self.app.post("/relock", status_code=200)
+        async def receive_relock_from_client(response: Response, lock_entry: LockEntry):
+            if self.leader != self.name:
+                response.status_code = 418
+                if self.leader is None:
+                    message = "I don't know who the leader is.🤷"
+                else:
+                    message = f"I'm not a leader! Send the request to 👉{self.leader}"
+                return {"message": message}
+            (locked, version) = await self.processing_relock_from_client(lock_entry)
+            if not locked:
+                response.status_code = 409
+            return {"locked": locked, "version": version}
+        
+        @self.app.post("/unlock", status_code=200)
+        async def receive_unlock_from_client(response: Response, lock_entry: LockEntry):
+            if self.leader != self.name:
+                response.status_code = 418
+                if self.leader is None:
+                    message = "I don't know who the leader is.🤷"
+                else:
+                    message = f"I'm not a leader! Send the request to 👉{self.leader}"
+                return {"message": message}
+            await self.unlock(key=lock_entry.lock_name, currValue=lock_entry.lock_owner, currVersion=lock_entry.lock_version)
+            return {}
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -270,26 +296,6 @@ class Node:
             self.next_index[node] -= 1
             self.match_index[node] = 0
 
-    async def processing_set_from_client(self, data: Entry):
-        print(
-            f"{self.state} {self.host}:{self.port} received a set request from client: {data}"
-        )
-        new_entry_index = len(self.log)
-        self.log.append(
-            LogEntry(
-                command_index=Commands.SET,
-                command_input=data,
-                term=self.current_term,
-                index=new_entry_index
-            )
-        )
-
-        async def wait_for_applying():
-            while self.last_applied < new_entry_index:
-                await asyncio.sleep(1)
-
-        await wait_for_applying()
-
     async def start_election(self):
         self.state = NodeState.CANDIDATE
         self.current_term += 1
@@ -355,13 +361,6 @@ class Node:
             self.votes_count = 0
             await self.election_timer.start()
 
-
-    #################################################################################
-    # Функции, используемые в блокировке
-    #################################################################################
-    
-    
-
     # If there exists an N such that N > commitIndex, a majority
     # of matchIndex[i] ≥ N, and log[N].term == currentTerm:
     # set commitIndex = N
@@ -384,6 +383,79 @@ class Node:
                 self.last_applied += 1
 
 
+    #################################################################################
+    # Функции, используемые в блокировке
+    #################################################################################
+    
+    
+    async def processing_set_from_client(self, client_data: SetData):
+        print(
+            f"{self.state} {self.host}:{self.port} received a set request from client: {client_data}"
+        )
+        async with self.lock:
+            is_owner = self.is_access_granted(key=client_data.entry.key, lock_owner=client_data.lock_owner, lock_version=client_data.lock_version)
+            if not is_owner:
+                return False, {"message": "You're not an owner! Please, lock the resource first"}
+            
+            new_entry_index = len(self.log)
+            self.log.append(
+                LogEntry(
+                    command_index=Commands.SET,
+                    command_input=client_data.entry,
+                    term=self.current_term,
+                    index=new_entry_index
+                )
+            )
+
+            async def wait_for_applying():
+                while self.last_applied < new_entry_index:
+                    await asyncio.sleep(1)
+
+            await wait_for_applying()
+            return True, client_data.entry
+
+
+    async def processing_lock_from_client(self, lock_entry: LockEntry):
+        print(
+            f"{self.state} {self.host}:{self.port} received a lock request from client: {lock_entry}"
+        )
+        locked, version, error = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue='unlocked', currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
+        if error is not None:
+            locked, version, error = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue=None, currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
+        if locked:
+            async def watchdog():
+                await asyncio.sleep(lock_entry.lock_ttl)
+                await self.unlock(key=lock_entry.lock_name, currValue=lock_entry.lock_owner, currVersion=version)
+                
+            asyncio.ensure_future(watchdog())
+        return locked, version
+    
+
+    async def unlock(self, key: str, currValue: str, currVersion: int):
+        locked, _, _ = await self.compare_and_swap(key=key, nextValue='unlocked', currValue=currValue, currVersion=currVersion, ttl=0)
+        print(
+            f"{self.state} {self.host}:{self.port} is unlocking for key = {key} ... {locked}"
+        )
+        
+        
+    async def processing_relock_from_client(self, lock_entry: LockEntry):
+        print(
+            f"{self.state} {self.host}:{self.port} received a relock request for {lock_entry.lock_name} from client: {lock_entry.lock_owner}"
+        )
+        locked, version, _ = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue=lock_entry.lock_owner, currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
+        return locked, version
+
+
+    def is_access_granted(self, key: str, lock_owner: str, lock_version: str):
+        try:
+            found: LockEntry = self.lock_log[key]
+            if (found.lock_owner == lock_owner) and (found.lock_version == lock_version):
+                return True
+            return False
+        except KeyError as e:
+            return False
+
+
     async def compare_and_swap(self, key: str, nextValue: str, currValue: str, currVersion: int, ttl: int):
         async with self.lock:
             try:
@@ -401,28 +473,3 @@ class Node:
                     self.lock_log[key] = LockEntry(lock_name=key, lock_owner=nextValue, lock_version=version, lock_ttl=ttl)
                     return True, version, None
                 return False, version, f"For key='{key}' expected lock_owner='{currValue}' and version='{currVersion}' but was empty value"
-                
-
-
-    async def processing_lock_from_client(self, lock_entry: LockEntry):
-        print(
-            f"{self.state} {self.host}:{self.port} received a lock request from client: {lock_entry}"
-        )
-        locked, version, error = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue='unlocked', currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
-        if error is not None:
-            print(error)
-            locked, version, error = await self.compare_and_swap(key=lock_entry.lock_name, nextValue=lock_entry.lock_owner, currValue=None, currVersion=lock_entry.lock_version, ttl=lock_entry.lock_ttl)
-        if locked:
-            async def watchdog():
-                await asyncio.sleep(lock_entry.lock_ttl)
-                await self.unlock(key=lock_entry.lock_name, currValue=lock_entry.lock_owner, currVersion=version)
-                
-            asyncio.ensure_future(watchdog())
-        return locked, version
-
-
-    async def unlock(self, key: str, currValue: str, currVersion: int):
-        print(
-            f"{self.state} {self.host}:{self.port} is unlocking for key = {key}"
-        )
-        await self.compare_and_swap(key=key, nextValue='unlocked', currValue=currValue, currVersion=currVersion, ttl=0)
