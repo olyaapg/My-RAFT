@@ -42,8 +42,8 @@ class Node:
         self.match_index = {}
 
         self.leader = None
-        self.election_timer = MyTimer(6, self.start_election, True)
-        self.leader_timer = MyTimer(2, self.heartbeat)
+        self.election_timer = MyTimer(2, self.start_election, True)
+        self.leader_timer = MyTimer(0.5, self.heartbeat)
 
         @self.app.get("/", status_code=200)
         def hello_from_node():
@@ -73,17 +73,14 @@ class Node:
             return {"status": "received"}
 
         @self.app.get("/get/{key}", status_code=200)
-        def receive_get_from_client(response: Response, key: str):
-            print(
-                f"{self.state} {self.host}:{self.port} received a get request from client: key={key}"
-            )
+        async def receive_get_from_client(response: Response, key: str):
+            # print(f"{self.state} {self.host}:{self.port} received a GET request from client: key={key}")
             try:
-                entry = Entry(key=key, value=None)
-                entry.value = self.state_machine.apply_command(Commands.GET, entry)
+                result = await self.processing_get_from_client(key)
             except KeyError:
                 response.status_code = 404
-                return {"message": "Incorrect key"}
-            return entry.value
+                return {"message": f"Key '{key}' not found"}
+            return result
 
         @self.app.post("/set", status_code=200)
         async def receive_set_from_client(response: Response, request: Entry):
@@ -98,7 +95,7 @@ class Node:
             return {}
         
         @self.app.post("/cas", status_code=200)
-        def receive_cas_from_client(response: Response, request: Entry):
+        async def receive_cas_from_client(response: Response, request: Entry):
             if self.leader != self.name:
                 response.status_code = 418
                 if self.leader is None:
@@ -106,7 +103,7 @@ class Node:
                 else:
                     message = f"I'm not a leader! Send the request to 👉{self.leader}"
                 return {"message": message}
-            self.processing_cas_from_client(request)
+            await asyncio.to_thread(self.processing_cas_from_client, request)
             return {}
 
     @asynccontextmanager
@@ -200,7 +197,7 @@ class Node:
         # print(
         #     f"{self.state} {self.host}:{self.port} received an append entries: {request.model_dump()}\n"
         # )
-        print(f'{request.term}, {self.current_term}')
+        # print(f'{request.term}, {self.current_term}')
         if request.term < self.current_term:
             await self.send_message(
                 request.leader_id,
@@ -223,7 +220,7 @@ class Node:
                 request.leader_id,
                 AppendEntriesResponse(term=self.current_term, success=False)
             )
-            print(f"LOG   {self.log}\n")
+            # print(f"LOG   {self.log}\n")
             await self.election_timer.start()
             return
         if len(request.entries) > 0:
@@ -234,7 +231,7 @@ class Node:
                 self.state_machine.apply_command(
                     command_index=entry.command_index, command_input=entry.command_input
                 )
-        print(f"LOG   {self.log}\n")
+        # print(f"LOG   {self.log}\n")
         await self.send_message(
             request.leader_id,
             AppendEntriesResponse(term=self.current_term, success=True)
@@ -262,9 +259,9 @@ class Node:
             self.match_index[node] = 0
 
     async def processing_set_from_client(self, data: Entry):
-        print(
-            f"{self.state} {self.host}:{self.port} received a set request from client: {data}"
-        )
+        # print(
+        #     f"{self.state} {self.host}:{self.port} received a set request from client: {data}"
+        # )
         new_entry_index = len(self.log)
         self.log.append(
             LogEntry(
@@ -281,10 +278,15 @@ class Node:
 
         await wait_for_applying()
 
+    async def processing_get_from_client(self, key: str):
+        entry = Entry(key=key, value=None)
+        entry.value = await asyncio.to_thread(self.state_machine.apply_command, Commands.GET, entry)
+        return entry.value
+
     def processing_cas_from_client(self, data: Entry):
-        print(
-            f"{self.state} {self.host}:{self.port} received a cas request from client: {data}"
-        )
+        # print(
+        #     f"{self.state} {self.host}:{self.port} received a cas request from client: {data}"
+        # )
         new_entry_index = len(self.log)
         self.log.append(
             LogEntry(
@@ -301,7 +303,7 @@ class Node:
         self.votes_count = 1
         self.voted_for = self.name
         self.leader = None
-        print(f"{self.name}: election is starting! Term - {self.current_term}")
+        # print(f"{self.name}: election is starting! Term - {self.current_term}")
         await self.send_parallel_messages(
             self.nodes,
             RequestVote(
@@ -314,7 +316,7 @@ class Node:
         await self.election_timer.start()
 
     async def become_leader(self):
-        print(f"{self.name}: I'm a leader!")
+        # print(f"{self.name}: I'm a leader!")
         self.state = NodeState.LEADER
         await self.election_timer.cancel()
         self.leader = self.name
@@ -354,7 +356,7 @@ class Node:
         if term > self.current_term or candidate:
             self.current_term = term
             self.state = NodeState.FOLLOWER
-            print("When updating the term, I became a FOLLOWER")
+            # print("When updating the term, I became a FOLLOWER")
             await self.leader_timer.cancel()
             self.voted_for = None
             self.votes_count = 0
